@@ -17,7 +17,7 @@ use std::path::Path;
 
 use base64;
 use hcore::crypto::BoxKeyPair;
-use common::ui::UI;
+use common::ui::{UI, UIWriter};
 use depot_client::{self, Client};
 use common::command::package::install::{RETRIES, RETRY_WAIT};
 

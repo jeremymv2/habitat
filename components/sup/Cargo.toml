@@ -19,9 +19,11 @@ ansi_term = "*"
 base64 = "*"
 bitflags = "*"
 byteorder = "*"
+bytes = "0.4"
 clap = { version = "*", features = [ "suggestions", "color", "unstable" ] }
 env_logger = "*"
 features = "*"
+futures = "0.1"
 glob = "*"
 habitat_butterfly = { path = "../butterfly" }
 habitat_common = { path = "../common" }
@@ -44,8 +46,9 @@ lazy_static = "*"
 libc = "*"
 log = "*"
 notify = "*"
+pbr = "*"
 persistent = "*"
-protobuf = "*"
+protobuf = { version = "1.4", features = ["bytes"] }
 rand = "*"
 regex = "*"
 router = "*"
@@ -57,6 +60,9 @@ tabwriter = "*"
 tempdir = "*"
 time = "*"
 toml = { version = "*", default-features = false }
+tokio = "0.1"
+tokio-core = "0.1"
+tokio-io = "0.1"
 url = "*"
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -76,5 +82,9 @@ git = "https://github.com/habitat-sh/core.git"
 [dev-dependencies.habitat_butterfly]
 path = "../butterfly"
 
+[build-dependencies]
+protoc = "1.4"
+protoc-rust = "1.4"
+
 [features]
-apidocs =[]
+apidocs = []

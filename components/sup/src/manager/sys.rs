@@ -20,6 +20,7 @@ use hcore;
 
 use VERSION;
 use config::GossipListenAddr;
+use ctl_gateway;
 use error::{Error, Result};
 use http_gateway;
 
@@ -40,13 +41,20 @@ pub struct Sys {
     pub hostname: String,
     pub gossip_ip: IpAddr,
     pub gossip_port: u16,
+    pub ctl_gateway_ip: IpAddr,
+    pub ctl_gateway_port: u16,
     pub http_gateway_ip: IpAddr,
     pub http_gateway_port: u16,
     pub permanent: bool,
 }
 
 impl Sys {
-    pub fn new(permanent: bool, gossip: GossipListenAddr, http: http_gateway::ListenAddr) -> Sys {
+    pub fn new(
+        permanent: bool,
+        gossip: GossipListenAddr,
+        ctl: ctl_gateway::ListenAddr,
+        http: http_gateway::ListenAddr,
+    ) -> Sys {
         let ip = match lookup_ip() {
             Ok(ip) => ip,
             Err(e) => {
@@ -70,6 +78,8 @@ impl Sys {
             hostname: host,
             gossip_ip: gossip.ip(),
             gossip_port: gossip.port(),
+            ctl_gateway_ip: ctl.ip(),
+            ctl_gateway_port: ctl.port(),
             http_gateway_ip: http.ip(),
             http_gateway_port: http.port(),
             permanent: permanent,
@@ -82,9 +92,15 @@ impl Sys {
         sys_info.set_hostname(self.hostname.clone());
         sys_info.set_gossip_ip(self.gossip_ip.to_string());
         sys_info.set_gossip_port(self.gossip_port as u32);
+        sys_info.set_ctl_gateway_ip(self.ctl_gateway_ip.to_string());
+        sys_info.set_ctl_gateway_port(self.ctl_gateway_port as u32);
         sys_info.set_http_gateway_ip(self.http_gateway_ip.to_string());
         sys_info.set_http_gateway_port(self.http_gateway_port as u32);
         sys_info
+    }
+
+    pub fn ctl_listen(&self) -> ctl_gateway::ListenAddr {
+        ctl_gateway::ListenAddr::new(self.ctl_gateway_ip, self.ctl_gateway_port)
     }
 
     pub fn gossip_listen(&self) -> SocketAddr {

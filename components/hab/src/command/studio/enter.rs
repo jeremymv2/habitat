@@ -17,7 +17,7 @@ use std::fs as stdfs;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use common::ui::UI;
+use common::ui::{UI, UIWriter};
 use hcore::crypto::CACHE_KEY_PATH_ENV_VAR;
 use hcore::env as henv;
 use hcore::fs;

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod ctl;
 pub mod service;
 #[macro_use]
 mod debug;
@@ -25,49 +26,63 @@ mod peer_watcher;
 mod user_config_watcher;
 mod sys;
 
-use std::collections::HashMap;
+use std;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::result;
-use std::thread;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use std::mem;
 use std::ops::DerefMut;
+use std::rc::Rc;
 
 use butterfly;
 use butterfly::member::Member;
 use butterfly::trace::Trace;
 use butterfly::server::timing::Timing;
 use butterfly::server::Suitability;
+use common::ui::UIWriter;
+use futures::prelude::*;
+use futures::sync::mpsc;
 use hcore::crypto::{default_cache_key_path, SymKey};
 use hcore::env;
 use hcore::fs::FS_ROOT_PATH;
-use hcore::service::ServiceGroup;
 use hcore::os::process::{self, Pid, Signal};
 use hcore::package::{Identifiable, PackageIdent, PackageInstall};
+use hcore::package::metadata::PackageType;
+use hcore::service::ServiceGroup;
 use launcher_client::{LAUNCHER_LOCK_CLEAN_ENV, LAUNCHER_PID_ENV, LauncherCli};
 use serde;
 use serde_json;
 use time::{self, Timespec, Duration as TimeDuration};
+use tokio_core::reactor;
 
-pub use self::service::{CompositeSpec, Service, ServiceBind, ServiceSpec, UpdateStrategy, Topology};
+pub use self::service::{CompositeSpec, Service, ServiceBind, ServiceSpec, Spec, UpdateStrategy,
+                        Topology};
 pub use self::sys::Sys;
+use self::ctl::*;
 use self::self_updater::{SUP_PKG_IDENT, SelfUpdater};
-use self::service::{DesiredState, Pkg, ProcessState, StartStyle};
+use self::service::{DesiredState, IntoServiceSpec, Pkg, ProcessState, StartStyle};
 use self::service_updater::ServiceUpdater;
 use self::spec_watcher::{SpecWatcher, SpecWatcherEvent};
 use self::peer_watcher::PeerWatcher;
 use self::user_config_watcher::UserConfigWatcher;
 use VERSION;
-use error::{Error, Result, SupError};
 use config::GossipListenAddr;
+use ctl_gateway;
+use ctl_gateway::server::CtlRequest;
+use ctl_gateway::codec::*;
 use census::CensusRing;
+use error::{Error, Result, SupError};
 use http_gateway;
+use net::{self, NetResult, ErrCode};
+use protocols;
+use util;
 
 const MEMBER_ID_FILE: &'static str = "MEMBER_ID";
 const PROC_LOCK_FILE: &'static str = "LOCK";
@@ -127,10 +142,13 @@ impl FsCfg {
 #[derive(Clone, Default)]
 pub struct ManagerConfig {
     pub auto_update: bool,
+    pub custom_state_path: Option<PathBuf>,
     pub eventsrv_group: Option<ServiceGroup>,
     pub update_url: String,
     pub update_channel: String,
     pub gossip_listen: GossipListenAddr,
+    pub ctl_auth_key: String,
+    pub ctl_listen: ctl_gateway::ListenAddr,
     pub http_listen: http_gateway::ListenAddr,
     pub gossip_peers: Vec<SocketAddr>,
     pub gossip_permanent: bool,
@@ -138,11 +156,12 @@ pub struct ManagerConfig {
     pub name: Option<String>,
     pub organization: Option<String>,
     pub watch_peer_file: Option<String>,
-
-    custom_state_path: Option<PathBuf>,
 }
 
 pub struct Manager {
+    /// The configuration used to instantiate this Manager instance
+    pub cfg: Rc<ManagerConfig>,
+
     butterfly: butterfly::Server,
     census_ring: CensusRing,
     events_group: Option<ServiceGroup>,
@@ -194,6 +213,30 @@ impl Manager {
         obtain_process_lock(&fs_cfg)?;
 
         Self::new(cfg, fs_cfg, launcher)
+    }
+
+    /// Given an installed package, generate a spec (or specs, in the case
+    /// of composite packages!) from it and the arguments passed in on the
+    /// command line.
+    pub fn generate_new_specs_from_package(
+        package: &PackageInstall,
+        opts: &SvcLoadOpts,
+    ) -> Result<Vec<ServiceSpec>> {
+        let specs = match package.pkg_type()? {
+            PackageType::Standalone => {
+                let mut spec = ServiceSpec::default();
+                opts.into_spec(&mut spec);
+                vec![spec]
+            }
+            PackageType::Composite => {
+                opts.into_composite_spec(
+                    package.ident().name.clone(),
+                    package.pkg_services()?,
+                    package.bind_map()?,
+                )
+            }
+        };
+        Ok(specs)
     }
 
     pub fn service_status(cfg: &ManagerConfig, ident: &PackageIdent) -> Result<ServiceStatus> {
@@ -264,6 +307,7 @@ impl Manager {
 
     fn new(cfg: ManagerConfig, fs_cfg: FsCfg, launcher: LauncherCli) -> Result<Manager> {
         let current = PackageIdent::from_str(&format!("{}/{}", SUP_PKG_IDENT, VERSION)).unwrap();
+        let cfg_static = cfg.clone();
         let self_updater = if cfg.auto_update {
             if current.fully_qualified() {
                 Some(SelfUpdater::new(
@@ -278,7 +322,12 @@ impl Manager {
         } else {
             None
         };
-        let mut sys = Sys::new(cfg.gossip_permanent, cfg.gossip_listen, cfg.http_listen);
+        let mut sys = Sys::new(
+            cfg.gossip_permanent,
+            cfg.gossip_listen,
+            cfg.ctl_listen,
+            cfg.http_listen,
+        );
         let member = Self::load_member(&mut sys, &fs_cfg)?;
         let ring_key = match cfg.ring {
             Some(ref ring_with_revision) => {
@@ -316,6 +365,7 @@ impl Manager {
             None
         };
         Ok(Manager {
+            cfg: Rc::new(cfg_static),
             self_updater: self_updater,
             updater: ServiceUpdater::new(server.clone()),
             census_ring: CensusRing::new(sys.member_id.clone()),
@@ -382,6 +432,47 @@ impl Manager {
         let mut p = Self::composites_path(&Self::state_path_from(cfg)).join(&ident.name);
         p.set_extension("spec");
         p
+    }
+
+    /// Given a `PackageIdent`, return current specs if they exist. If
+    /// the package is a standalone service, only that spec will be
+    /// returned, but if it is a composite, the composite spec as well as
+    /// the specs for all the services in the composite will be returned.
+    pub fn existing_specs_for_ident(
+        cfg: &ManagerConfig,
+        ident: &PackageIdent,
+    ) -> Result<Option<Spec>> {
+        let default_spec = ServiceSpec::default_for(ident.clone());
+        let spec_file = Self::spec_path_for(cfg, &default_spec);
+
+        // Try it as a service first
+        if let Ok(spec) = ServiceSpec::from_file(&spec_file) {
+            Ok(Some(Spec::Service(spec)))
+        } else {
+            // Try it as a composite next
+            let composite_spec_file = Self::composite_path_by_ident(&cfg, ident);
+            match CompositeSpec::from_file(composite_spec_file) {
+                Ok(composite_spec) => {
+                    let fs_root_path = Path::new(&*FS_ROOT_PATH);
+                    let package =
+                        PackageInstall::load(composite_spec.package_ident(), Some(fs_root_path))?;
+                    let mut specs = vec![];
+
+                    let services = package.pkg_services()?;
+                    for service in services {
+                        let spec = ServiceSpec::from_file(Manager::spec_path_for(
+                            cfg,
+                            &ServiceSpec::default_for(service),
+                        ))?;
+                        specs.push(spec);
+                    }
+
+                    Ok(Some(Spec::Composite(composite_spec, specs)))
+                }
+                // Looks like we have no specs for this thing at all
+                Err(_) => Ok(None),
+            }
+        }
     }
 
     pub fn save_spec_for(cfg: &ManagerConfig, spec: &ServiceSpec) -> Result<()> {
@@ -544,6 +635,14 @@ impl Manager {
     }
 
     pub fn run(&mut self) -> Result<()> {
+        let mut core = reactor::Core::new().expect("Couldn't start main reactor");
+        let handle = core.handle();
+        let (ctl_tx, ctl_rx) = mpsc::unbounded();
+        let ctl_handler = CtlAcceptor::new(self.cfg.clone(), ctl_rx).for_each(move |handler| {
+            handle.spawn(handler);
+            Ok(())
+        });
+        core.handle().spawn(ctl_handler);
         self.start_initial_services_from_spec_watcher()?;
 
         outputln!(
@@ -554,6 +653,10 @@ impl Manager {
         debug!("gossip-listener started");
         self.persist_state();
         let http_listen_addr = self.sys.http_listen();
+        let ctl_listen_addr = self.sys.ctl_listen();
+        outputln!("Starting ctl-gateway on {}", &ctl_listen_addr);
+        ctl_gateway::server::run(ctl_listen_addr, ctl_tx);
+        debug!("ctl-gateway started");
         outputln!("Starting http-gateway on {}", &http_listen_addr);
         http_gateway::Server::new(self.fs_cfg.clone(), http_listen_addr)
             .start()?;
@@ -630,11 +733,246 @@ impl Manager {
                     self.gossip_latest_service_rumor(&service);
                 }
             }
-            let time_to_wait = (next_check - time::get_time()).num_milliseconds();
-            if time_to_wait > 0 {
-                thread::sleep(Duration::from_millis(time_to_wait as u64));
+            let time_to_wait = ((next_check - time::get_time()).num_milliseconds() as u64).max(100);
+            core.turn(Some(Duration::from_millis(time_to_wait)));
+        }
+    }
+
+    pub fn service_load(
+        cfg: &ManagerConfig,
+        req: &mut CtlRequest,
+        opts: SvcLoadOpts,
+    ) -> NetResult<()> {
+        // TODO (CM): should load be able to download new artifacts if
+        // you're re-loading with --force?
+        // If we've already got a spec for this thing, we don't want to
+        // inadvertently download a new version
+
+        match Self::existing_specs_for_ident(cfg, &opts.ident)? {
+            None => {
+                // We don't have any record of this thing; let's set it up!
+                //
+                // This will install the latest version from Builder
+                let installed =
+                    util::pkg::install(req, opts.bldr_url(), &opts.source, opts.bldr_channel())?;
+                let mut specs = Self::generate_new_specs_from_package(&installed, &opts)?;
+
+                for spec in specs.iter_mut() {
+                    // "load" == persistent services, by definition
+                    spec.start_style = StartStyle::Persistent;
+                    Self::save_spec_for(cfg, spec)?;
+                    req.info(format!(
+                        "The {} service was successfully loaded",
+                        spec.ident
+                    ))?;
+                }
+
+                // Only saves a composite spec if it's, well, a composite
+                if let Ok(composite_spec) =
+                    CompositeSpec::from_package_install(&opts.source.as_ref(), &installed)
+                {
+                    Self::save_composite_spec_for(cfg, &composite_spec)?;
+                    req.info(format!(
+                        "The {} composite was successfully loaded",
+                        composite_spec.ident()
+                    ))?;
+                }
+                Ok(())
+            }
+            Some(spec) => {
+                // We've seen this service / composite before. Thus `load`
+                // basically acts as a way to edit spec files on the
+                // command line. As a result, we a) check that you
+                // *really* meant to change an existing spec, and b) DO
+                // NOT download a potentially new version of the package
+                // in question
+
+                if !opts.force {
+                    // TODO (CM): make this error reflect composites
+                    return Err(net::err(
+                        ErrCode::Conflict,
+                        format!(
+                            "Service already loaded, unload '{}' and try again",
+                            &opts.ident
+                        ),
+                    ));
+                }
+
+                match spec {
+                    Spec::Service(mut service_spec) => {
+                        opts.into_spec(&mut service_spec);
+                        service_spec.start_style = StartStyle::Persistent;
+
+                        // Only install if we don't have something
+                        // locally; otherwise you could potentially
+                        // upgrade each time you load.
+                        //
+                        // Also make sure you're pulling from where you're
+                        // supposed to be pulling from!
+                        util::pkg::satisfy_or_install(
+                            req,
+                            &opts.source,
+                            &service_spec.bldr_url,
+                            &service_spec.channel,
+                        )?;
+
+                        Self::save_spec_for(cfg, &service_spec)?;
+                        req.info(format!(
+                            "The {} service was successfully loaded",
+                            service_spec.ident
+                        ))?;
+                        Ok(())
+                    }
+                    Spec::Composite(composite_spec, mut existing_service_specs) => {
+                        if opts.source.as_ref() == composite_spec.ident() {
+                            let mut bind_map =
+                                match util::pkg::installed(composite_spec.package_ident()) {
+                                    Some(package) => package.bind_map()?,
+                                    // TODO (CM): this should be a proper error
+                                    None => unreachable!(),
+                                };
+
+                            for mut service_spec in existing_service_specs.iter_mut() {
+                                opts.update_composite(&mut bind_map, &mut service_spec);
+                                Self::save_spec_for(cfg, service_spec)?;
+                                req.info(format!(
+                                    "The {} service was successfully loaded",
+                                    service_spec.ident
+                                ))?;
+                            }
+                            req.info(format!(
+                                "The {} composite was successfully loaded",
+                                composite_spec.ident()
+                            ))?;
+                        } else {
+                            // It changed!
+                            // OK, here's the deal.
+                            //
+                            // We're going to install a new composite if
+                            // we need to in order to satisfy the spec
+                            // we've now got. That also means that the
+                            // services that are currently running may get
+                            // unloaded (because they are no longer in the
+                            // composite), and new services may start
+                            // (because they were added to the composite).
+
+                            let installed_package = util::pkg::satisfy_or_install(
+                                req,
+                                &opts.source,
+                                // This (updating from the command-line
+                                // args) is a difference from
+                                // force-loading a spec, because
+                                // composites don't auto-update themselves
+                                // like services can.
+                                opts.bldr_url(),
+                                opts.bldr_channel(),
+                            )?;
+
+                            // Generate new specs from the new composite package and
+                            // CLI inputs
+                            let new_service_specs =
+                                Self::generate_new_specs_from_package(&installed_package, &opts)?;
+
+                            // Delete any specs that are not in the new
+                            // composite
+                            let mut old_spec_names = HashSet::new();
+                            for s in existing_service_specs.iter() {
+                                old_spec_names.insert(s.ident.name.clone());
+                            }
+                            let mut new_spec_names = HashSet::new();
+                            for s in new_service_specs.iter() {
+                                new_spec_names.insert(s.ident.name.clone());
+                            }
+
+                            let specs_to_delete: HashSet<_> =
+                                old_spec_names.difference(&new_spec_names).collect();
+                            for spec in existing_service_specs.iter() {
+                                if specs_to_delete.contains(&spec.ident.name) {
+                                    let file = Manager::spec_path_for(cfg, spec);
+                                    req.info(format!("Unloading {:?}", file))?;
+                                    std::fs::remove_file(&file).map_err(|err| {
+                                        sup_error!(Error::ServiceSpecFileIO(file, err))
+                                    })?;
+                                }
+                            }
+                            // <-- end of deletion
+
+                            // Save all the new specs. If there are
+                            // services that exist in both composites,
+                            // their service spec files will have the same
+                            // name, so they'll be taken care of here (we
+                            // don't need to treat them differently)
+                            for spec in new_service_specs.iter() {
+                                Self::save_spec_for(cfg, spec)?;
+                                req.info(format!(
+                                    "The {} service was successfully loaded",
+                                    spec.ident
+                                ))?;
+                            }
+
+                            // Generate and save the new spec
+                            let new_composite_spec = CompositeSpec::from_package_install(
+                                opts.source.as_ref(),
+                                &installed_package,
+                            )?;
+                            Self::save_composite_spec_for(cfg, &new_composite_spec)?;
+                            req.info(format!(
+                                "The {} composite was successfully loaded",
+                                new_composite_spec.ident()
+                            ))?;
+                        }
+                        Ok(())
+                    }
+                }
             }
         }
+    }
+
+    pub fn service_start(
+        cfg: &ManagerConfig,
+        req: &mut CtlRequest,
+        opts: SvcStartOpts,
+    ) -> NetResult<()> {
+        let updated_specs = match Self::existing_specs_for_ident(&cfg, &opts.ident)? {
+            Some(Spec::Service(mut spec)) => {
+                let mut updated_specs = vec![];
+                if spec.desired_state == DesiredState::Down {
+                    spec.desired_state = DesiredState::Up;
+                    updated_specs.push(spec);
+                }
+                updated_specs
+            }
+            Some(Spec::Composite(_, service_specs)) => {
+                let mut updated_specs = vec![];
+                for mut spec in service_specs {
+                    if spec.desired_state == DesiredState::Down {
+                        spec.desired_state = DesiredState::Up;
+                        updated_specs.push(spec);
+                    }
+                }
+                updated_specs
+            }
+            None => {
+                return Err(net::err(
+                    ErrCode::NotFound,
+                    format!("Failed to locate service, {}", &opts.ident),
+                ));
+            }
+        };
+
+        let specs_changed = updated_specs.len() > 0;
+
+        for spec in updated_specs.iter() {
+            Self::save_spec_for(&cfg, spec)?;
+        }
+
+        if specs_changed {
+            req.info(format!(
+                "Supervisor starting {}. See the Supervisor output for more details.",
+                &opts.ident
+            ))?;
+        }
+        Ok(())
     }
 
     fn check_for_updated_supervisor(&mut self) -> Option<PackageInstall> {
@@ -1198,6 +1536,70 @@ where
         Err(err) => Err(sup_error!(
             Error::ProcessLockIO(lock_path.as_ref().to_path_buf(), err)
         )),
+    }
+}
+
+struct CtlAcceptor {
+    cfg: Rc<ManagerConfig>,
+    rx: ctl_gateway::server::MgrReceiver,
+}
+
+impl CtlAcceptor {
+    fn new(cfg: Rc<ManagerConfig>, rx: ctl_gateway::server::MgrReceiver) -> Self {
+        CtlAcceptor { cfg: cfg, rx: rx }
+    }
+}
+
+impl Stream for CtlAcceptor {
+    type Item = CtlHandler;
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        match self.rx.poll() {
+            Ok(Async::Ready(Some(cmd))) => {
+                let task = CtlHandler::new(cmd, self.cfg.clone());
+                Ok(Async::Ready(Some(task)))
+            }
+            Ok(Async::Ready(None)) => Ok(Async::Ready(None)),
+            Ok(Async::NotReady) => Ok(Async::NotReady),
+            Err(e) => {
+                debug!("CtlAcceptor error, {:?}", e);
+                Err(())
+            }
+        }
+    }
+}
+
+struct CtlHandler {
+    cmd: ctl_gateway::server::CtlCommand,
+    cfg: Rc<ManagerConfig>,
+}
+
+impl CtlHandler {
+    fn new(cmd: ctl_gateway::server::CtlCommand, cfg: Rc<ManagerConfig>) -> Self {
+        CtlHandler { cmd: cmd, cfg: cfg }
+    }
+}
+
+impl Future for CtlHandler {
+    type Item = ();
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        match self.cmd.run(&self.cfg) {
+            Ok(()) => {
+                if self.cmd.req.transactional() {
+                    self.cmd.req.reply_complete(SrvMessage::<protocols::ctl::NetOk>::new());
+                }
+            }
+            Err(err) => {
+                debug!("CtlHandler failed, {:?}", err);
+                if self.cmd.req.transactional() {
+                    self.cmd.req.reply_complete(err);
+                }
+            }
+        }
+        Ok(Async::Ready(()))
     }
 }
 

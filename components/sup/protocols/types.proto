@@ -1,0 +1,46 @@
+syntax = "proto2";
+
+// Encapsulate all possible sources we can install packages from.
+enum InstallSource {
+  // Install from a remote hosting the package
+  Ident = 0;
+  // Install from a local archive file
+  Archive = 1;
+}
+
+// The relationship of a service with peers in the same service group.
+enum Topology {
+  Standalone = 0;
+  Leader = 1;
+}
+
+enum UpdateStrategy {
+  None = 0;
+  AtOnce = 1;
+  Rolling = 2;
+}
+
+message ApplicationEnvironment {
+  required string application = 1;
+  optional string environment = 2 [default = "default"];
+}
+
+message PackageIdent {
+  optional string origin = 1;
+  optional string name = 2;
+  optional string version = 3;
+  optional string release = 4;
+}
+
+message ServiceBind {
+  required string name = 1;
+  required ServiceGroup service_group = 2;
+}
+
+message ServiceGroup {
+  required string service = 1;
+  optional string group = 2 [default = "default"];
+  optional ApplicationEnvironment application_environment = 3;
+  optional string organization = 4;
+}
+

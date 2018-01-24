@@ -49,7 +49,7 @@ mod util;
 
 use std::env;
 
-use common::ui::UI;
+use common::ui::{UI, UIWriter};
 use hcore::{channel, PROGRAM_NAME};
 use hcore::url as hurl;
 

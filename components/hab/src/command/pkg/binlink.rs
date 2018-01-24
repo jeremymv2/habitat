@@ -15,7 +15,7 @@
 use std::fs;
 use std::path::Path;
 
-use common::ui::{Status, UI};
+use common::ui::{Status, UI, UIWriter};
 use hcore::package::{PackageIdent, PackageInstall};
 use hcore::os::filesystem;
 use hcore::fs as hfs;
@@ -132,7 +132,7 @@ mod test {
     use std::path::Path;
     use std::sync::{Arc, RwLock};
 
-    use common::ui::{Coloring, UI};
+    use common::ui::{Coloring, UI, UIWriter};
     use hcore;
     use hcore::package::{PackageIdent, PackageTarget};
     use tempdir::TempDir;

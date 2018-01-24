@@ -18,7 +18,7 @@ use std::str::FromStr;
 
 use api_client;
 use depot_client::{self, SchedulerResponse};
-use common::ui::{Status, UI};
+use common::ui::{Status, UI, UIWriter, UIReader};
 
 use {PRODUCT, VERSION};
 use error::{Error, Result};
@@ -189,7 +189,7 @@ mod test {
     use std::io::{self, Cursor, Write};
     use std::sync::{Arc, RwLock};
 
-    use common::ui::{Coloring, UI};
+    use common::ui::{Coloring, UI, UIWriter};
     use depot_client::{Project, SchedulerResponse};
     use super::get_ident_list;
 

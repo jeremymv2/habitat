@@ -59,8 +59,10 @@ pub use self::config::{Cfg, UserConfigPath};
 pub use self::health::{HealthCheck, SmokeCheck};
 pub use self::package::Pkg;
 pub use self::composite_spec::CompositeSpec;
-pub use self::spec::{DesiredState, ServiceBind, ServiceSpec, StartStyle};
+pub use self::spec::{BindMap, DesiredState, IntoServiceSpec, ServiceBind, ServiceSpec, Spec,
+                     StartStyle};
 pub use self::supervisor::ProcessState;
+pub use protocols::types::{Topology, UpdateStrategy};
 
 static LOGKEY: &'static str = "SR";
 
@@ -109,7 +111,7 @@ pub struct Service {
     #[serde(skip_serializing)]
     /// Whether a service's default configuration changed on a package
     /// update. Used to control when templates are re-rendered.
-    defaults_updated: bool
+    defaults_updated: bool,
 }
 
 impl Service {
@@ -163,7 +165,7 @@ impl Service {
             last_health_check: None,
             svc_encrypted_password: spec.svc_encrypted_password,
             composite: spec.composite,
-            defaults_updated: false
+            defaults_updated: false,
         })
     }
 
@@ -385,7 +387,8 @@ impl Service {
             "Service update failed; unable to find own service group",
         );
         let cfg_updated_from_rumors = self.cfg.update(census_group);
-        let cfg_changed = self.defaults_updated || cfg_updated_from_rumors || self.user_config_updated;
+        let cfg_changed = self.defaults_updated || cfg_updated_from_rumors ||
+            self.user_config_updated;
 
         if self.user_config_updated {
             if let Err(e) = self.cfg.reload_user() {
@@ -406,8 +409,8 @@ impl Service {
                 let reload = self.compile_hooks(&ctx);
 
                 // If the configuration has changed, execute the `reload` and `reconfigure` hooks.
-                // Note that the configuration does not necessarily change every time the user config has (e.g.
-                // when only a comment has been added to the latter)
+                // Note that the configuration does not necessarily change every time the user
+                // config has (e.g. when only a comment has been added to the latter)
                 let reconfigure = self.compile_configuration(&ctx);
 
                 (reload, reconfigure)
@@ -810,13 +813,6 @@ impl fmt::Display for Service {
     }
 }
 
-/// The relationship of a service with peers in the same service group.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum Topology {
-    Standalone,
-    Leader,
-}
-
 impl Topology {
     fn as_str(&self) -> &str {
         match *self {
@@ -866,13 +862,6 @@ impl serde::Serialize for Topology {
     {
         serializer.serialize_str(self.as_str())
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum UpdateStrategy {
-    None,
-    AtOnce,
-    Rolling,
 }
 
 impl UpdateStrategy {

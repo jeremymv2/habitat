@@ -18,7 +18,7 @@ We add the following software to augment the Linux From Scratch toolchain:
 * A copy of curl’s [cacert.pem](https://curl.haxx.se/ca/cacert.pem) certificates - used by wget when connecting to SSL-enabled websites. This is copied into the tarball as `/tools/etc/cacert.pem`.
 * A small wrapper script for `wget` so that we use the SSL certificates we added to the tarball. Its source is:
 
-```sh
+```shell
 #!/tools/bin/busybox sh
 exec /tools/bin/wget.real --ca-certificate /tools/etc/cacert.pem $*
 ```
@@ -28,6 +28,36 @@ Finally, we place a recent last-known-good copy of the `hab` binary inside `tool
 The entire tarball of bootstrap "tools" lives inside the [stage1 studio](http://s3-us-west-2.amazonaws.com/habitat-studio-stage1/habitat-studio-stage1-20180312233639.tar.xz) tarball. This should be unpacked into `/tools` on a Linux host that will serve as the build environment until the system is self-sustaining through the rest of this procedure.
 
 ## Part II: Stage 0
+
+### Creating The stage1 tarball
+
+```shell
+$ TARFILE=~ubuntu/habitat-studio-stage1-$(date -u +%Y%m%d%H%M%S).tar
+
+$ tar cf $TARFILE -C /mnt/lfs tools
+
+$ hab install core/cacerts core/wget-static core/busybox-static core/rq core/hab
+
+$ mkdir -p tools/{bin,etc}
+
+$ cat <<EOF > tools/bin/wget
+#!/tools/bin/busybox sh
+exec /tools/bin/wget.real --ca-certificate /tools/etc/cacert.pem \$*
+EOF
+$ chmod 755 tools/bin/wget
+
+$ cp -p $(hab pkg path core/wget-static)/bin/wget tools/bin/wget.real
+$ cp -p $(hab pkg path core/busybox-static)/bin/busybox tools/bin/busybox
+$ cp -p $(hab pkg path core/rq)/bin/rq tools/bin/rq
+$ cp -p $(hab pkg path core/hab)/bin/hab tools/bin/hab
+$ cp -p $(hab pkg path core/cacerts)/ssl/certs/cacert.pem tools/etc/cacert.pem
+$ (cd tools/bin && ln -sv ./busybox unzip)
+
+$ tar --append --file $TARFILE tools
+$ xz --compress -9 --threads=0 --verbose $TARFILE
+
+$ cp -v ${TARFILE}.xz /tmp/
+```
 
 ### Freshening The stage1 tarball
 
@@ -48,7 +78,7 @@ $ tar --delete --file=${tarxz/.xz/} tools/bin/hab
 
 # Extract new version of hab in correct path structure
 $ hart=/src/core-hab-0.6.0-20160701014820-x86_64-linux.hart
-$ jmkdir -p /tmp/tools/bin
+$ mkdir -p /tmp/tools/bin
 $ tail -n +6 $hart \\
   | xzcat \\
   | (cd /tmp/tools/bin && tar x --no-anchored bin/hab --strip-components=7)
@@ -94,25 +124,20 @@ $ ./habitat/components/hab/install.sh
 $ hab origin key generate core
 ```
 
+```shell
+$ sudo rm -rf ./results ./tmp/*.db
+```
+
 Finally, we export several environment variables before entering the Studio:
 
 ```shell
-$ export HAB_STUDIO_NOSTUDIORC=true
-$ export NO_ARTIFACT_PATH=true
-$ export STUDIO_TYPE=stage1
-$ export HAB_STUDIO_ROOT=/hab/studios/stage1
-$ export HAB_ORIGIN=core
-$ hab studio enter
+$ ./core-plans/bin/bootstrap/stage1-studio.sh enter
 ```
 
 Now in the stage1 Studio:
 
 ```studio
-$ export BUILD=/src/habitat/components/plan-build/bin/hab-plan-build.sh
-$ export NO_INSTALL_DEPS=true
-$ export DB_PREFIX=stage1-
-$ rm -rf ./results ./tmp/${DB_PREFIX}*.db
-$ time record ${DB_PREFIX}base ./core-plans/bin/build-base-plans.sh
+$ ./core-plans/bin/bootstrap/stage1-build-base-plans.sh
 ```
 
 TODO fn: replace this to the end...
